@@ -1,0 +1,7 @@
+# Link the C runtime statically: no VC++ redistributable needed, and no VCRUNTIME140.dll /
+# api-ms-win-crt-*.dll that could be picked up from the exe's folder.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

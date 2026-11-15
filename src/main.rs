@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod etw;
+mod ignore_dlg;
 mod sensors;
 mod tray;
 
@@ -29,6 +30,8 @@ const PAD: i32 = 8;
 const MARGIN: i32 = 0;
 const HOTKEY_TOGGLE: i32 = 1; // Ctrl+Shift+F11
 const HOTKEY_QUIT: i32 = 2; // Ctrl+Shift+F12
+/// A detected game that stops presenting frames stays "detected" this long while focused.
+const STALL_KEEP: Duration = Duration::from_secs(60);
 
 /// Processes that present frames but are never "the game".
 const IGNORE: &[&str] = &[
@@ -72,7 +75,17 @@ struct App {
     stats: Option<etw::Stats>,
     cpu: Option<f32>,
     gpu: Option<f32>,
-    nvml: Option<Option<sensors::Nvml>>, // None = not tried yet
+    nvml: Option<sensors::Nvml>, // None = not loaded (yet, or after a failure)
+    /// When the detected game stopped delivering frames (None while it presents).
+    stall_since: Option<Instant>,
+    /// The tray icon is installed (re-tried from the timer until Explorer accepts it).
+    tray_ok: bool,
+    nvml_retry_at: Instant,
+    nvml_delay: Duration,
+    etw_retry_at: Instant,
+    /// The initial session start worked, so a dead session is restarted.
+    etw_ok: bool,
+    etw_fails: u32,
     thermal: Option<sensors::Thermal>,
     names: HashMap<u32, ProcInfo>,
     ignore: Vec<String>,
@@ -128,25 +141,47 @@ fn load_ignore_list() -> Vec<String> {
             );
         }
     }
+    list.extend(ignore_dlg::load());
     list
 }
 
 struct ProcInfo {
     name: String,
     ignored: bool,
+    /// Process creation time; tells a recycled PID apart from the process we cached.
+    start: u64,
+}
+
+/// Creation time of a process (FILETIME), 0 if it cannot be queried.
+fn process_start(pid: u32) -> u64 {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return 0;
+        }
+        let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) =
+            (zeroed(), zeroed(), zeroed(), zeroed());
+        let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u);
+        CloseHandle(h);
+        if ok == 0 {
+            return 0;
+        }
+        ((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64
+    }
 }
 
 fn proc_info(pid: u32, hwnd: HWND, ignore: &[String]) -> ProcInfo {
+    let start = process_start(pid);
     match process_path(pid) {
         Some(path) => {
             let name = path.rsplit('\\').next().unwrap_or(&path).to_owned();
             let lower = path.to_ascii_lowercase();
             let system = lower.starts_with(r"c:\windows\");
             let ignored = system || ignore.iter().any(|i| *i == name.to_ascii_lowercase());
-            ProcInfo { name, ignored }
+            ProcInfo { name, ignored, start }
         }
         // Protected processes (e.g. some anti-cheat) may deny the query: fall back to the title.
-        None => ProcInfo { name: window_title(hwnd), ignored: false },
+        None => ProcInfo { name: window_title(hwnd), ignored: false, start },
     }
 }
 
@@ -185,8 +220,29 @@ fn covers_monitor(hwnd: HWND) -> bool {
 // ------------------------------------------------------------------ tick
 
 fn tick(app: &mut App) {
-    let now = etw::now();
-    etw::prune(now);
+    etw::prune();
+
+    if !app.tray_ok {
+        app.tray_ok = tray::add(app.hwnd, app.icon);
+    }
+
+    // The ETW session can die (stopped by someone else, driver hiccup): restart it.
+    // A failed restart is retried every 5 s; the error is only shown after 3 failures in a row.
+    if app.etw_ok && !etw::running() && Instant::now() >= app.etw_retry_at {
+        app.etw_retry_at = Instant::now() + Duration::from_secs(5);
+        match etw::start(etw::SESSION) {
+            Ok(()) => {
+                app.etw_fails = 0;
+                app.etw_error = None;
+            }
+            Err(e) => {
+                app.etw_fails += 1;
+                if app.etw_fails >= 3 {
+                    app.etw_error = Some(e);
+                }
+            }
+        }
+    }
 
     let own = unsafe { GetCurrentProcessId() };
     let fg = unsafe { GetForegroundWindow() };
@@ -200,16 +256,37 @@ fn tick(app: &mut App) {
     let mut detected = None;
     if fg_pid != 0 && fg_pid != own {
         let ignore = &app.ignore;
+        // A cached entry for a recycled PID must not be reused for a different process.
+        let start = process_start(fg_pid);
+        if app.names.get(&fg_pid).is_some_and(|i| i.start != start) {
+            app.names.remove(&fg_pid);
+        }
         let info = app.names.entry(fg_pid).or_insert_with(|| proc_info(fg_pid, fg, ignore));
         let name = info.name.clone();
         if !info.ignored {
-            if let Some(st) = etw::stats(fg_pid, now) {
-                let sticky = app.game.as_ref().is_some_and(|g| g.pid == fg_pid);
-                if sticky || (st.fps >= 15.0 && covers_monitor(fg)) {
-                    detected = Some((Game { pid: fg_pid, name }, st));
+            let sticky = app.game.as_ref().is_some_and(|g| g.pid == fg_pid);
+            match etw::stats(fg_pid) {
+                Some(st) => {
+                    if sticky || (st.fps >= 15.0 && covers_monitor(fg)) {
+                        app.stall_since = None;
+                        detected = Some((Game { pid: fg_pid, name }, Some(st)));
+                    }
                 }
+                // No frames for a while (loading screen, alt-tab stall): a detected game
+                // stays detected while it is still in the foreground, showing "--",
+                // for at most STALL_KEEP.
+                None if sticky => {
+                    let since = *app.stall_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() < STALL_KEEP {
+                        detected = Some((Game { pid: fg_pid, name }, None));
+                    }
+                }
+                None => {}
             }
         }
+    }
+    if detected.is_none() {
+        app.stall_since = None;
     }
     if app.names.len() > 512 {
         app.names.clear();
@@ -217,18 +294,38 @@ fn tick(app: &mut App) {
 
     match detected {
         Some((game, st)) => {
-            app.stats = Some(st);
+            app.stats = st;
             app.game = Some(game);
             // NVML is loaded lazily so an idle Optimus dGPU is not woken up needlessly.
-            if app.nvml.is_none() {
-                app.nvml = Some(sensors::Nvml::load());
+            // A failed load is retried with back-off (10 s, doubling up to 5 min): the
+            // driver/dGPU may not be ready yet, or may be gone for good.
+            let backoff = |app: &mut App| {
+                app.nvml_retry_at = Instant::now() + app.nvml_delay;
+                app.nvml_delay = (app.nvml_delay * 2).min(Duration::from_secs(300));
+            };
+            if app.nvml.is_none() && Instant::now() >= app.nvml_retry_at {
+                app.nvml = sensors::Nvml::load();
+                if app.nvml.is_none() {
+                    backoff(app);
+                }
             }
-            app.gpu = app.nvml.as_ref().and_then(|n| n.as_ref()).and_then(|n| n.temp());
+            app.gpu = app.nvml.as_mut().and_then(|n| n.temp());
+            if app.nvml.as_ref().is_some_and(|n| n.healthy()) {
+                app.nvml_delay = Duration::from_secs(10);
+            }
+            // Persistent failures (driver reset/update): shut NVML down and start over.
+            if app.nvml.as_ref().is_some_and(|n| n.needs_reload()) {
+                app.nvml = None;
+                backoff(app);
+            }
         }
         None => {
             app.game = None;
             app.stats = None;
             app.gpu = None;
+            if let Some(n) = app.nvml.as_mut() {
+                n.reset(); // don't show a stale temperature at the start of the next game
+            }
         }
     }
     app.cpu = app.thermal.as_mut().and_then(|t| t.read());
@@ -508,6 +605,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        ignore_dlg::WM_IGNORE_CHANGED => {
+            // Ignore list edited in the dialog: reload it and re-evaluate every process.
+            let p = with_app(|a| {
+                a.ignore = load_ignore_list();
+                a.names.clear();
+                tick(a);
+                placement(a)
+            })
+            .flatten();
+            apply_placement(hwnd, p);
+            0
+        }
         tray::WM_TRAY => {
             match lp as u32 {
                 WM_RBUTTONUP | WM_CONTEXTMENU => {
@@ -523,6 +632,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             .flatten();
                             apply_placement(hwnd, p);
                         }
+                        tray::CMD_IGNORE => ignore_dlg::open(hwnd),
                         tray::CMD_AUTOSTART => tray::set_autostart(!tray::autostart_enabled()),
                         tray::CMD_QUIT => {
                             DestroyWindow(hwnd);
@@ -539,16 +649,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_DESTROY => {
             tray::remove(hwnd);
-            etw::stop();
+            etw::stop(etw::SESSION);
             PostQuitMessage(0);
             0
         }
         _ => {
             // Explorer restarted: the tray icon is gone and must be re-added.
             if msg == TASKBAR_CREATED.load(Ordering::Relaxed) && msg != 0 {
-                if let Some(icon) = with_app(|a| a.icon) {
-                    tray::add(hwnd, icon);
-                }
+                with_app(|a| a.tray_ok = tray::add(hwnd, a.icon));
                 return 0;
             }
             DefWindowProcW(hwnd, msg, wp, lp)
@@ -573,7 +681,7 @@ fn relaunch_as_admin() -> bool {
             null_mut(),
             wide("runas").as_ptr(),
             buf.as_ptr(),
-            null(),
+            wide("--elevated").as_ptr(), // tells the new instance not to ask again
             null(),
             SW_SHOWNORMAL,
         );
@@ -581,24 +689,53 @@ fn relaunch_as_admin() -> bool {
     }
 }
 
+/// The exe is a GUI-subsystem program, so `--probe` has no console of its own: attach to
+/// the parent's, keeping stdout if it was redirected.
+fn attach_console() {
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows_sys::Win32::System::Console::*;
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            let out = CreateFileW(
+                wide("CONOUT$").as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            );
+            if out != INVALID_HANDLE_VALUE {
+                SetStdHandle(STD_OUTPUT_HANDLE, out);
+            }
+        }
+    }
+}
+
 /// `overlay.exe --probe`: print presenting processes and sensor readings, then exit.
 fn probe() {
-    match etw::start() {
+    attach_console();
+    println!();
+    // Own session name: must not stop the session of a running overlay.
+    match etw::start(etw::PROBE_SESSION) {
         Ok(()) => println!("ETW session: ok"),
         Err(e) => println!("ETW session: error {e}"),
     }
     let mut thermal = sensors::Thermal::new();
     std::thread::sleep(Duration::from_secs(4));
-    let now = etw::now();
-    for pid in etw::active_pids(now) {
-        if let Some(st) = etw::stats(pid, now) {
+    for pid in etw::active_pids() {
+        if let Some(st) = etw::stats(pid) {
             let name = process_name(pid).unwrap_or_else(|| "?".into());
             println!("{pid:>6}  {name:<32} {:>6.1} fps  {:>6.2} ms", st.fps, st.frametime_ms);
         }
     }
     println!("CPU (thermal zone): {}", fmt_temp(thermal.as_mut().and_then(|t| t.read())));
-    println!("GPU (NVML): {}", fmt_temp(sensors::Nvml::load().and_then(|n| n.temp())));
-    etw::stop();
+    println!("GPU (NVML): {}", fmt_temp(sensors::Nvml::load().and_then(|mut n| n.temp())));
+    etw::stop(etw::PROBE_SESSION);
 }
 
 fn main() {
@@ -617,9 +754,11 @@ fn main() {
         }
 
         // ETW needs admin (or Performance Log Users). Try first, elevate only if denied.
-        let etw_error = match etw::start() {
+        let etw_error = match etw::start(etw::SESSION) {
             Ok(()) => None,
-            Err(5) => {
+            // Ask for elevation once: an instance started by `runas` (--elevated) never
+            // asks again, so a setup where access stays denied cannot loop.
+            Err(5) if !std::env::args().any(|a| a == "--elevated") => {
                 CloseHandle(mutex);
                 if relaunch_as_admin() {
                     return;
@@ -664,7 +803,7 @@ fn main() {
             null(),
         );
         if hwnd.is_null() {
-            etw::stop();
+            etw::stop(etw::SESSION);
             return;
         }
         SetLayeredWindowAttributes(hwnd, 0, ALPHA, LWA_ALPHA);
@@ -672,9 +811,14 @@ fn main() {
         RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F11 as u32);
         RegisterHotKey(hwnd, HOTKEY_QUIT, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F12 as u32);
 
-        let icon = tray::make_icon();
-        TASKBAR_CREATED.store(tray::taskbar_created_msg(), Ordering::Relaxed);
-        tray::add(hwnd, icon);
+        let icon = tray::load_icon().unwrap_or_else(tray::make_icon);
+        let taskbar_created = tray::taskbar_created_msg();
+        TASKBAR_CREATED.store(taskbar_created, Ordering::Relaxed);
+        // This process is usually elevated: Explorer's (lower integrity) TaskbarCreated
+        // broadcast is only delivered if explicitly allowed.
+        ChangeWindowMessageFilterEx(hwnd, taskbar_created, MSGFLT_ALLOW, null_mut());
+        // At logon the taskbar may not exist yet: if this fails, tick() retries.
+        let tray_ok = tray::add(hwnd, icon);
         tray::refresh_autostart();
 
         APP.with(|a| {
@@ -685,6 +829,14 @@ fn main() {
                 cpu: None,
                 gpu: None,
                 nvml: None,
+                stall_since: None,
+                tray_ok,
+                nvml_retry_at: Instant::now(),
+                nvml_delay: Duration::from_secs(10),
+                etw_retry_at: Instant::now(),
+                // Only "access denied" is final; anything else is retried every 5 s.
+                etw_ok: etw_error != Some(5),
+                etw_fails: 0,
                 thermal: sensors::Thermal::new(),
                 names: HashMap::new(),
                 ignore: load_ignore_list(),
@@ -704,6 +856,10 @@ fn main() {
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            let dlg = ignore_dlg::hwnd();
+            if !dlg.is_null() && IsDialogMessageW(dlg, &msg) != 0 {
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

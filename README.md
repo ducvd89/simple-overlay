@@ -18,9 +18,18 @@ Grab `simple-overlay.exe` from the [latest release](../../releases/latest) and r
   Windows 11 puts new tray icons in the hidden area (^); drag it onto the taskbar if you want it always visible.
 - `Ctrl+Shift+F11`: show/hide the overlay
 - `Ctrl+Shift+F12`: exit
-- `simple-overlay.exe --probe`: print the processes currently presenting frames plus sensor readings (for debugging)
+- `simple-overlay.exe --probe`: print the processes currently presenting frames plus sensor readings (for debugging); run it from a terminal, it attaches to that console. It uses its own ETW session, so it is safe while the overlay is running.
 
-Settings are stored in `HKCU\Software\FpsOverlay`; "Start with Windows" uses `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+"Start with Windows" creates a per-user scheduled task (`FpsOverlay-<your SID>`, run at logon with highest privileges), so the overlay starts as admin without a UAC prompt at every login. Turn the option on while the overlay is running elevated (it asks for UAC once at launch); if the task cannot be created it falls back to a normal Run entry (UAC prompt at login).
+
+Because the task runs elevated, it never launches an exe from a folder you can write to. Turning the option on copies the exe to `C:\Program Files\SimpleOverlay\overlay.exe` and the task starts that copy.
+- **Updating:** exit the overlay, then run the new exe with autostart on; if it is newer and different it replaces the installed copy. An older exe never replaces a newer installed one.
+- **Turning it off** removes the task and the installed copy. If the installed copy is the running exe it cannot be deleted while running; it is left behind and can be deleted after exiting.
+- If the overlay is already on at startup and runs as admin, it also converts an old Run entry into the task and refreshes the installed copy.
+- `ignore.txt` is read from next to the exe that is running; for the installed copy use the **Hidden apps...** dialog instead.
+- Rare NVIDIA driver glitches are logged to `C:\Program Files\SimpleOverlay\overlay.log` (when installed), otherwise to the debugger output (OutputDebugString).
+
+Settings are stored in `HKCU\Software\FpsOverlay`; the Run entry fallback uses `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
 ## How it works
 
@@ -32,7 +41,13 @@ Settings are stored in `HKCU\Software\FpsOverlay`; "Start with Windows" uses `HK
 
 ## Ignoring apps
 
-Create `ignore.txt` next to the exe with one executable name per line (e.g. `myapp.exe`).
+Right-click the tray icon and choose **Hidden apps...** to open a dialog where you can pick a running app, type an exe name, or browse for an exe. The list is saved in `HKCU\Software\FpsOverlay` (`IgnoredApps`) and applies immediately.
+
+You can also create `ignore.txt` next to the exe with one executable name per line (e.g. `myapp.exe`).
+
+## Icon
+
+The app icon (a frametime line on a dark tile) is `assets/icon.ico`, embedded in the exe and used for the tray and the dialog. `assets/make_icon.ps1` regenerates it (and `assets/icon.png`); `build.rs` embeds it without needing a resource compiler.
 
 ## Building
 
